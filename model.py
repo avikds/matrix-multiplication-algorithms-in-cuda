@@ -801,8 +801,69 @@ void launch_matmul_double_buffered(const float* A, const float* B, float* C,
     );
 }
 
-# Step 11 - matmul_nt_kernel (not yet solved)
-# TODO: implement
+# Step 11 - matmul_nt_kernel
+constexpr int TILE_NT = 16;
+
+__global__ void matmul_nt_kernel(const float* A, const float* B, float* C,
+                                 int M, int N, int K) {
+    __shared__ float As[TILE_NT][TILE_NT];
+    __shared__ float Bs[TILE_NT][TILE_NT];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int row = blockIdx.y * TILE_NT + ty;
+    const int col = blockIdx.x * TILE_NT + tx;
+
+    float acc = 0.0f;
+
+    const int num_tiles = (K + TILE_NT - 1) / TILE_NT;
+
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        const int k0 = tile * TILE_NT;
+        const int k = k0 + tx;
+
+        // Load A[row][k0 + tx].
+        if (row < M && k < K) {
+            As[ty][tx] = A[row * K + k];
+        } else {
+            As[ty][tx] = 0.0f;
+        }
+
+        // Load B[block_col + ty][k0 + tx].
+        // B has N rows and K columns.
+        const int b_row = blockIdx.x * TILE_NT + ty;
+
+        if (b_row < N && k < K) {
+            Bs[ty][tx] = B[b_row * K + k];
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        // C[row][col] = A[row] dot B[col].
+        #pragma unroll
+        for (int i = 0; i < TILE_NT; ++i) {
+            acc += As[ty][i] * Bs[tx][i];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}
+
+void launch_matmul_nt(const float* A, const float* B, float* C,
+                      int M, int N, int K) {
+    dim3 block(TILE_NT, TILE_NT);
+    dim3 grid((N + TILE_NT - 1) / TILE_NT,
+              (M + TILE_NT - 1) / TILE_NT);
+
+    matmul_nt_kernel<<<grid, block>>>(A, B, C, M, N, K);
+}
 
 # Step 12 - matmul_batched_kernel (not yet solved)
 # TODO: implement
