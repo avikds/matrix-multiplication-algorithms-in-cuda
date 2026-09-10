@@ -601,8 +601,205 @@ void launch_matmul_vectorized(const float* A, const float* B, float* C,
     matmul_vectorized_kernel<<<grid, block>>>(A, B, C, M, N, K);
 }
 
-# Step 10 - matmul_double_buffered_kernel (not yet solved)
-# TODO: implement
+# Step 10 - matmul_double_buffered_kernel
+constexpr int D_BM = 64, D_BN = 64, D_BK = 8, D_TM = 4, D_TN = 4;
+
+__global__ void matmul_double_buffered_kernel(const float* A, const float* B, float* C,
+                                              int M, int N, int K) {
+    __shared__ float As[2][D_BM * D_BK];
+    __shared__ float Bs[2][D_BK * D_BN];
+
+    const int tid = threadIdx.x;
+
+    // Each thread owns a 4x4 output tile.
+    const int trow = (tid / 16) * D_TM;
+    const int tcol = (tid % 16) * D_TN;
+
+    const int block_row = blockIdx.y * D_BM;
+    const int block_col = blockIdx.x * D_BN;
+
+    const int global_row_start = block_row + trow;
+    const int global_col_start = block_col + tcol;
+
+    float acc[D_TM][D_TN] = {};
+
+    const int num_tiles = (K + D_BK - 1) / D_BK;
+
+    // ------------------------------------------------------------
+    // Load K-tile 0 into shared-memory stage 0.
+    // There are 512 A elements and 512 B elements, so each of
+    // 256 threads loads two A elements and two B elements.
+    // ------------------------------------------------------------
+    for (int i = tid; i < D_BM * D_BK; i += 256) {
+        const int local_row = i / D_BK;
+        const int local_col = i % D_BK;
+
+        const int global_row = block_row + local_row;
+        const int global_col = local_col;
+
+        if (global_row < M && global_col < K) {
+            As[0][i] = A[global_row * K + global_col];
+        } else {
+            As[0][i] = 0.0f;
+        }
+    }
+
+    for (int i = tid; i < D_BK * D_BN; i += 256) {
+        const int local_row = i / D_BN;
+        const int local_col = i % D_BN;
+
+        const int global_row = local_row;
+        const int global_col = block_col + local_col;
+
+        if (global_row < K && global_col < N) {
+            Bs[0][i] = B[global_row * N + global_col];
+        } else {
+            Bs[0][i] = 0.0f;
+        }
+    }
+
+    __syncthreads();
+
+    int current_stage = 0;
+
+    // ------------------------------------------------------------
+    // Process each K tile.
+    // ------------------------------------------------------------
+    for (int t = 0; t < num_tiles; ++t) {
+        const int next_stage = 1 - current_stage;
+
+        // --------------------------------------------------------
+        // Prefetch tile t+1 into registers.
+        // Each thread loads two A values and two B values.
+        // --------------------------------------------------------
+        float prefetch_A[2] = {0.0f, 0.0f};
+        float prefetch_B[2] = {0.0f, 0.0f};
+
+        if (t + 1 < num_tiles) {
+            const int next_k_base = (t + 1) * D_BK;
+
+            // The two A elements owned by this thread.
+            for (int q = 0; q < 2; ++q) {
+                const int idx = tid + q * 256;
+
+                const int local_row = idx / D_BK;
+                const int local_col = idx % D_BK;
+
+                const int global_row = block_row + local_row;
+                const int global_col = next_k_base + local_col;
+
+                if (global_row < M && global_col < K) {
+                    prefetch_A[q] =
+                        A[global_row * K + global_col];
+                }
+            }
+
+            // The two B elements owned by this thread.
+            for (int q = 0; q < 2; ++q) {
+                const int idx = tid + q * 256;
+
+                const int local_row = idx / D_BN;
+                const int local_col = idx % D_BN;
+
+                const int global_row = next_k_base + local_row;
+                const int global_col = block_col + local_col;
+
+                if (global_row < K && global_col < N) {
+                    prefetch_B[q] =
+                        B[global_row * N + global_col];
+                }
+            }
+        }
+
+        // --------------------------------------------------------
+        // Compute from the current shared-memory stage.
+        // --------------------------------------------------------
+        for (int k = 0; k < D_BK; ++k) {
+            float regA[D_TM];
+            float regB[D_TN];
+
+            #pragma unroll
+            for (int i = 0; i < D_TM; ++i) {
+                regA[i] =
+                    As[current_stage][(trow + i) * D_BK + k];
+            }
+
+            #pragma unroll
+            for (int j = 0; j < D_TN; ++j) {
+                regB[j] =
+                    Bs[current_stage][k * D_BN + (tcol + j)];
+            }
+
+            #pragma unroll
+            for (int i = 0; i < D_TM; ++i) {
+                #pragma unroll
+                for (int j = 0; j < D_TN; ++j) {
+                    acc[i][j] += regA[i] * regB[j];
+                }
+            }
+        }
+
+        // --------------------------------------------------------
+        // Write prefetched tile t+1 from registers into the
+        // alternate shared-memory stage.
+        // Every thread writes exactly the values it prefetched.
+        // --------------------------------------------------------
+        if (t + 1 < num_tiles) {
+            const int next_k_base = (t + 1) * D_BK;
+
+            for (int q = 0; q < 2; ++q) {
+                const int idx = tid + q * 256;
+
+                const int local_row = idx / D_BK;
+                const int local_col = idx % D_BK;
+
+                As[next_stage][idx] = prefetch_A[q];
+            }
+
+            for (int q = 0; q < 2; ++q) {
+                const int idx = tid + q * 256;
+
+                Bs[next_stage][idx] = prefetch_B[q];
+            }
+
+            // Exactly one synchronization before the next stage
+            // becomes visible to all threads.
+            __syncthreads();
+
+            current_stage = next_stage;
+        }
+    }
+
+    // ------------------------------------------------------------
+    // Store the 4x4 result tile with bounds checks.
+    // ------------------------------------------------------------
+    #pragma unroll
+    for (int i = 0; i < D_TM; ++i) {
+        const int row = global_row_start + i;
+
+        if (row < M) {
+            #pragma unroll
+            for (int j = 0; j < D_TN; ++j) {
+                const int col = global_col_start + j;
+
+                if (col < N) {
+                    C[row * N + col] = acc[i][j];
+                }
+            }
+        }
+    }
+}
+
+void launch_matmul_double_buffered(const float* A, const float* B, float* C,
+                                   int M, int N, int K) {
+    dim3 block(256);
+    dim3 grid((N + D_BN - 1) / D_BN,
+              (M + D_BM - 1) / D_BM);
+
+    matmul_double_buffered_kernel<<<grid, block>>>(
+        A, B, C, M, N, K
+    );
+}
 
 # Step 11 - matmul_nt_kernel (not yet solved)
 # TODO: implement
