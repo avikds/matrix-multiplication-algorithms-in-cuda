@@ -31,6 +31,29 @@ python scaffold.py
 - [x] **19.** matmul_lower_triangular_kernel
 - [x] **20.** matmul_dispatch
 
----
+## Results
 
-Built on Deep-ML.
+```
+GPU: Tesla T4 (40 SMs, 320 GB/s peak bandwidth)
+
+512x512x512, fp32, 10 timed launches each:
+  naive                 6.053 ms      44.3 GFLOP/s  max|err| 1.1e-05
+  coalesced             1.110 ms     241.7 GFLOP/s  max|err| 1.1e-05
+  tiled 16x16           0.725 ms     370.4 GFLOP/s  max|err| 1.1e-05
+  tiled 1D regs         0.351 ms     764.9 GFLOP/s  max|err| 1.1e-05
+  tiled 2D regs         0.282 ms     951.2 GFLOP/s  max|err| 1.1e-05
+  vectorized            0.256 ms    1049.6 GFLOP/s  max|err| 1.1e-05
+  double buffered       0.237 ms    1130.6 GFLOP/s  max|err| 1.1e-05
+  strassen 1 level      1.468 ms     182.9 GFLOP/s* max|err| 4.4e-05   (*counted as 2MNK; 7 tiled products of 256^3 plus 18 additions)
+  lower triangular      0.297 ms  vs tiled on the same triangular A    0.551 ms  max|err| 9.5e-06
+
+shape-specific kernels:
+  64x64x4096: double buffered 0.702 ms (16 blocks) vs split-K x8 0.095 ms (128 blocks), max|err| 2.0e-04
+  4096x4096 times a vector: coalesced GEMM 1.844 ms vs warp-per-row GEMV 0.256 ms (262 GB/s), max|err| 1.8e-04
+
+matmul_dispatch decisions:
+  4096 x    1 x 4096 -> gemv            max|err| 1.6e-04
+    32 x   32 x 2048 -> split-K         max|err| 6.5e-05
+   512 x  512 x  512 -> vectorized      max|err| 1.0e-05
+    33 x   65 x   17 -> double buffered max|err| 7.2e-07
+```
