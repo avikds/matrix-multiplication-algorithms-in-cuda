@@ -865,8 +865,75 @@ void launch_matmul_nt(const float* A, const float* B, float* C,
     matmul_nt_kernel<<<grid, block>>>(A, B, C, M, N, K);
 }
 
-# Step 12 - matmul_batched_kernel (not yet solved)
-# TODO: implement
+# Step 12 - matmul_batched_kernel
+constexpr int TILE_BATCH = 16;
+
+__global__ void matmul_batched_kernel(const float* A, const float* B, float* C,
+                                      int M, int N, int K) {
+    __shared__ float As[TILE_BATCH][TILE_BATCH];
+    __shared__ float Bs[TILE_BATCH][TILE_BATCH];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int row = blockIdx.y * TILE_BATCH + ty;
+    const int col = blockIdx.x * TILE_BATCH + tx;
+
+    const int batch_idx = blockIdx.z;
+
+    // Each batch element is stored contiguously:
+    // A: M x K
+    // B: K x N
+    // C: M x N
+    const float* Ab = A + batch_idx * M * K;
+    const float* Bb = B + batch_idx * K * N;
+    float* Cb = C + batch_idx * M * N;
+
+    float sum = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += TILE_BATCH) {
+        // Load A tile.
+        const int a_col = k0 + tx;
+
+        if (row < M && a_col < K) {
+            As[ty][tx] = Ab[row * K + a_col];
+        } else {
+            As[ty][tx] = 0.0f;
+        }
+
+        // Load B tile.
+        const int b_row = k0 + ty;
+
+        if (b_row < K && col < N) {
+            Bs[ty][tx] = Bb[b_row * N + col];
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < TILE_BATCH; ++k) {
+            sum += As[ty][k] * Bs[k][tx];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        Cb[row * N + col] = sum;
+    }
+}
+
+void launch_matmul_batched(const float* A, const float* B, float* C,
+                           int M, int N, int K, int batch) {
+    dim3 block(TILE_BATCH, TILE_BATCH);
+    dim3 grid((N + TILE_BATCH - 1) / TILE_BATCH,
+              (M + TILE_BATCH - 1) / TILE_BATCH,
+              batch);
+
+    matmul_batched_kernel<<<grid, block>>>(A, B, C, M, N, K);
+}
 
 # Step 13 - matmul_splitk_kernel (not yet solved)
 # TODO: implement
