@@ -380,8 +380,226 @@ void launch_matmul_tiled_2d(const float* A, const float* B, float* C, int M, int
     matmul_tiled_2d_kernel<<<grid, block>>>(A, B, C, M, N, K);
 }
 
-# Step 9 - matmul_vectorized_kernel (not yet solved)
-# TODO: implement
+# Step 9 - matmul_vectorized_kernel
+#include <cuda_runtime.h>
+
+constexpr int V_BM = 64, V_BN = 64, V_BK = 8, V_TM = 4, V_TN = 4;
+
+__global__ void matmul_vectorized_kernel(const float* A, const float* B, float* C,
+                                         int M, int N, int K) {
+    // A tile is stored transposed:
+    // As[k][m] -> As[k * V_BM + m]
+    __shared__ float As[V_BK * V_BM];
+
+    // B tile remains row-major.
+    __shared__ __align__(16) float Bs[V_BK * V_BN];
+
+    const int tid = threadIdx.x;
+
+    // Each thread owns a 4x4 output tile.
+    const int trow = (tid / 16) * V_TM;
+    const int tcol = (tid % 16) * V_TN;
+
+    const int block_row = blockIdx.y * V_BM;
+    const int block_col = blockIdx.x * V_BN;
+
+    const int global_row_start = block_row + trow;
+    const int global_col_start = block_col + tcol;
+
+    float acc[V_TM][V_TN] = {};
+
+    const int num_tiles = (K + V_BK - 1) / V_BK;
+
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        const int k_base = tile * V_BK;
+
+        // ------------------------------------------------------------
+        // Load A tile.
+        // Threads 0..127 each load one float4.
+        // r = tid / 2
+        // c = (tid % 2) * 4
+        // ------------------------------------------------------------
+        if (tid < 128) {
+            const int r = tid / 2;
+            const int c = (tid % 2) * 4;
+
+            const int global_row = block_row + r;
+            const int global_col = k_base + c;
+
+            float a0 = 0.0f;
+            float a1 = 0.0f;
+            float a2 = 0.0f;
+            float a3 = 0.0f;
+
+            if (global_row < M) {
+                // Normal aligned float4 load when all four elements
+                // are inside the K dimension.
+                if (global_col + 3 < K) {
+                    float4 value =
+                        *reinterpret_cast<const float4*>(
+                            A + global_row * K + global_col);
+
+                    a0 = value.x;
+                    a1 = value.y;
+                    a2 = value.z;
+                    a3 = value.w;
+                } else {
+                    // Partial final K tile.
+                    if (global_col < K) {
+                        a0 = A[global_row * K + global_col];
+                    }
+                    if (global_col + 1 < K) {
+                        a1 = A[global_row * K + global_col + 1];
+                    }
+                    if (global_col + 2 < K) {
+                        a2 = A[global_row * K + global_col + 2];
+                    }
+                    if (global_col + 3 < K) {
+                        a3 = A[global_row * K + global_col + 3];
+                    }
+                }
+            }
+
+            // Store A transposed:
+            // As[c + q][r]
+            As[(c + 0) * V_BM + r] = a0;
+            As[(c + 1) * V_BM + r] = a1;
+            As[(c + 2) * V_BM + r] = a2;
+            As[(c + 3) * V_BM + r] = a3;
+        }
+
+        // ------------------------------------------------------------
+        // Load B tile.
+        // Threads 0..127 each load one float4.
+        // r = tid / 16
+        // c = (tid % 16) * 4
+        //
+        // IMPORTANT: guard both row and column. This is required for
+        // partial and narrow N tiles.
+        // ------------------------------------------------------------
+        if (tid < 128) {
+            const int r = tid / 16;
+            const int c = (tid % 16) * 4;
+
+            const int global_row = k_base + r;
+            const int global_col = block_col + c;
+
+            float b0 = 0.0f;
+            float b1 = 0.0f;
+            float b2 = 0.0f;
+            float b3 = 0.0f;
+
+            if (global_row < K) {
+                if (global_col + 3 < N) {
+                    float4 value =
+                        *reinterpret_cast<const float4*>(
+                            B + global_row * N + global_col);
+
+                    b0 = value.x;
+                    b1 = value.y;
+                    b2 = value.z;
+                    b3 = value.w;
+                } else {
+                    // Partial final N tile.
+                    if (global_col < N) {
+                        b0 = B[global_row * N + global_col];
+                    }
+                    if (global_col + 1 < N) {
+                        b1 = B[global_row * N + global_col + 1];
+                    }
+                    if (global_col + 2 < N) {
+                        b2 = B[global_row * N + global_col + 2];
+                    }
+                    if (global_col + 3 < N) {
+                        b3 = B[global_row * N + global_col + 3];
+                    }
+                }
+            }
+
+            reinterpret_cast<float4*>(
+                &Bs[r * V_BN + c])[0] =
+                make_float4(b0, b1, b2, b3);
+        }
+
+        __syncthreads();
+
+        // ------------------------------------------------------------
+        // Compute 4x4 register tile.
+        // For each k:
+        //   - load 4 contiguous A values
+        //   - load one float4 B value
+        //   - perform 16 FMAs
+        // ------------------------------------------------------------
+        for (int k = 0; k < V_BK; ++k) {
+            float regA[V_TM];
+            float4 regB;
+
+            #pragma unroll
+            for (int i = 0; i < V_TM; ++i) {
+                regA[i] = As[k * V_BM + trow + i];
+            }
+
+            regB = reinterpret_cast<const float4*>(
+                &Bs[k * V_BN + tcol])[0];
+
+            #pragma unroll
+            for (int i = 0; i < V_TM; ++i) {
+                acc[i][0] += regA[i] * regB.x;
+                acc[i][1] += regA[i] * regB.y;
+                acc[i][2] += regA[i] * regB.z;
+                acc[i][3] += regA[i] * regB.w;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // ------------------------------------------------------------
+    // Store results.
+    // Use float4 when the complete 4-column vector is in range.
+    // For a partial N tile, store only valid scalar elements.
+    // ------------------------------------------------------------
+    #pragma unroll
+    for (int i = 0; i < V_TM; ++i) {
+        const int row = global_row_start + i;
+
+        if (row < M) {
+            if (global_col_start + 3 < N) {
+                float4 out = make_float4(
+                    acc[i][0],
+                    acc[i][1],
+                    acc[i][2],
+                    acc[i][3]
+                );
+
+                reinterpret_cast<float4*>(
+                    C + row * N + global_col_start)[0] = out;
+            } else {
+                if (global_col_start < N) {
+                    C[row * N + global_col_start] = acc[i][0];
+                }
+                if (global_col_start + 1 < N) {
+                    C[row * N + global_col_start + 1] = acc[i][1];
+                }
+                if (global_col_start + 2 < N) {
+                    C[row * N + global_col_start + 2] = acc[i][2];
+                }
+                if (global_col_start + 3 < N) {
+                    C[row * N + global_col_start + 3] = acc[i][3];
+                }
+            }
+        }
+    }
+}
+
+void launch_matmul_vectorized(const float* A, const float* B, float* C,
+                              int M, int N, int K) {
+    dim3 block(256);
+    dim3 grid((N + V_BN - 1) / V_BN,
+              (M + V_BM - 1) / V_BM);
+
+    matmul_vectorized_kernel<<<grid, block>>>(A, B, C, M, N, K);
+}
 
 # Step 10 - matmul_double_buffered_kernel (not yet solved)
 # TODO: implement
