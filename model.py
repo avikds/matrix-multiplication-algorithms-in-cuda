@@ -1109,8 +1109,31 @@ void launch_matmul_bias_relu(const float* A, const float* B,
     matmul_bias_relu_kernel<<<grid, block>>>(A, B, bias, C, M, N, K);
 }
 
-# Step 16 - matrix_addsub_kernel (not yet solved)
-# TODO: implement
+# Step 16 - matrix_addsub_kernel
+__global__ void matrix_addsub_kernel(const float* X, int ldx,
+                                     const float* Y, int ldy,
+                                     float* Z, int ldz,
+                                     int rows, int cols, float sign) {
+    const int c = blockIdx.x * 16 + threadIdx.x;
+    const int r = blockIdx.y * 16 + threadIdx.y;
+
+    if (r < rows && c < cols) {
+        Z[r * ldz + c] = X[r * ldx + c] + sign * Y[r * ldy + c];
+    }
+}
+
+void launch_matrix_addsub(const float* X, int ldx,
+                          const float* Y, int ldy,
+                          float* Z, int ldz,
+                          int rows, int cols, float sign) {
+    dim3 block(16, 16);
+    dim3 grid((cols + 15) / 16,
+              (rows + 15) / 16);
+
+    matrix_addsub_kernel<<<grid, block>>>(
+        X, ldx, Y, ldy, Z, ldz, rows, cols, sign
+    );
+}
 
 # Step 17 - strassen_one_level (not yet solved)
 # TODO: implement
