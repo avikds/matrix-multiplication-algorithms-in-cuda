@@ -1595,6 +1595,28 @@ void launch_matmul_lower_triangular(const float* A,
     );
 }
 
-# Step 20 - matmul_dispatch (not yet solved)
-# TODO: implement
+# Step 20 - matmul_dispatch
+int matmul_dispatch(const float* A, const float* B, float* C, int M, int N, int K) {
+    // N == 1: matrix-vector multiplication.
+    if (N == 1) {
+        launch_gemv(A, B, C, M, K);
+        return 0;
+    }
+
+    // Small output with large K: split the K dimension across 8 splits.
+    if (M * N <= 4096 && K >= 1024) {
+        launch_matmul_splitk(A, B, C, M, N, K, 8);
+        return 1;
+    }
+
+    // Dimensions suitable for float4 vectorized accesses.
+    if (K % 4 == 0 && N % 4 == 0) {
+        launch_matmul_vectorized(A, B, C, M, N, K);
+        return 2;
+    }
+
+    // General fallback.
+    launch_matmul_double_buffered(A, B, C, M, N, K);
+    return 3;
+}
 
