@@ -1048,8 +1048,66 @@ void launch_gemv(const float* A, const float* x, float* y, int M, int K) {
     gemv_kernel<<<grid, block>>>(A, x, y, M, K);
 }
 
-# Step 15 - matmul_bias_relu_kernel (not yet solved)
-# TODO: implement
+# Step 15 - matmul_bias_relu_kernel
+constexpr int TILE_EPI = 16;
+
+__global__ void matmul_bias_relu_kernel(const float* A, const float* B,
+                                        const float* bias, float* C,
+                                        int M, int N, int K) {
+    __shared__ float As[TILE_EPI][TILE_EPI];
+    __shared__ float Bs[TILE_EPI][TILE_EPI];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int row = blockIdx.y * TILE_EPI + ty;
+    const int col = blockIdx.x * TILE_EPI + tx;
+
+    float acc = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += TILE_EPI) {
+        const int a_col = k0 + tx;
+        const int b_row = k0 + ty;
+
+        // Load A tile.
+        if (row < M && a_col < K) {
+            As[ty][tx] = A[row * K + a_col];
+        } else {
+            As[ty][tx] = 0.0f;
+        }
+
+        // Load B tile.
+        if (b_row < K && col < N) {
+            Bs[ty][tx] = B[b_row * N + col];
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < TILE_EPI; ++k) {
+            acc += As[ty][k] * Bs[k][tx];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        float value = acc + bias[col];
+        C[row * N + col] = (value > 0.0f) ? value : 0.0f;
+    }
+}
+
+void launch_matmul_bias_relu(const float* A, const float* B,
+                             const float* bias, float* C,
+                             int M, int N, int K) {
+    dim3 block(TILE_EPI, TILE_EPI);
+    dim3 grid((N + TILE_EPI - 1) / TILE_EPI,
+              (M + TILE_EPI - 1) / TILE_EPI);
+
+    matmul_bias_relu_kernel<<<grid, block>>>(A, B, bias, C, M, N, K);
+}
 
 # Step 16 - matrix_addsub_kernel (not yet solved)
 # TODO: implement
