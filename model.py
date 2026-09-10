@@ -1009,8 +1009,44 @@ void launch_matmul_splitk(const float* A, const float* B, float* C,
     );
 }
 
-# Step 14 - gemv_kernel (not yet solved)
-# TODO: implement
+# Step 14 - gemv_kernel
+__global__ void gemv_kernel(const float* A, const float* x, float* y, int M, int K) {
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    const int row = blockIdx.x * 4 + warp;
+
+    if (row >= M) {
+        return;
+    }
+
+    float sum = 0.0f;
+
+    // Each lane processes every 32nd element of the row.
+    for (int k = lane; k < K; k += 32) {
+        sum += A[row * K + k] * x[k];
+    }
+
+    // Warp-wide XOR reduction.
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, offset);
+    }
+
+    if (lane == 0) {
+        y[row] = sum;
+    }
+}
+
+void launch_gemv(const float* A, const float* x, float* y, int M, int K) {
+    constexpr int THREADS = 128;
+    constexpr int WARPS_PER_BLOCK = 4;
+
+    dim3 block(THREADS);
+    dim3 grid((M + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+
+    gemv_kernel<<<grid, block>>>(A, x, y, M, K);
+}
 
 # Step 15 - matmul_bias_relu_kernel (not yet solved)
 # TODO: implement
