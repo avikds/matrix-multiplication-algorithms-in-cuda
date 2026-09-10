@@ -124,8 +124,62 @@ double matmul_gflops(int M, int N, int K, float ms) {
            / 1e9;
 }
 
-# Step 6 - matmul_tiled_kernel (not yet solved)
-# TODO: implement
+# Step 6 - matmul_tiled_kernel
+#include <cuda_runtime.h>
+
+constexpr int TILE_SMEM = 16;
+
+__global__ void matmul_tiled_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+    __shared__ float As[TILE_SMEM][TILE_SMEM];
+    __shared__ float Bs[TILE_SMEM][TILE_SMEM];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int col = blockIdx.x * TILE_SMEM + tx;
+    int row = blockIdx.y * TILE_SMEM + ty;
+
+    float sum = 0.0f;
+
+    int num_tiles = (K + TILE_SMEM - 1) / TILE_SMEM;
+
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        int a_col = tile * TILE_SMEM + tx;
+        int b_row = tile * TILE_SMEM + ty;
+
+        if (row < M && a_col < K) {
+            As[ty][tx] = A[row * K + a_col];
+        } else {
+            As[ty][tx] = 0.0f;
+        }
+
+        if (b_row < K && col < N) {
+            Bs[ty][tx] = B[b_row * N + col];
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        for (int k = 0; k < TILE_SMEM; ++k) {
+            sum += As[ty][k] * Bs[k][tx];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
+void launch_matmul_tiled(const float* A, const float* B, float* C, int M, int N, int K) {
+    dim3 block(TILE_SMEM, TILE_SMEM);
+    dim3 grid((N + TILE_SMEM - 1) / TILE_SMEM,
+              (M + TILE_SMEM - 1) / TILE_SMEM);
+
+    matmul_tiled_kernel<<<grid, block>>>(A, B, C, M, N, K);
+}
 
 # Step 7 - matmul_tiled_1d_kernel (not yet solved)
 # TODO: implement
