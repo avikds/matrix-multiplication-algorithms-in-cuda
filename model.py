@@ -271,8 +271,114 @@ void launch_matmul_tiled_1d(const float* A, const float* B, float* C, int M, int
     matmul_tiled_1d_kernel<<<grid, block>>>(A, B, C, M, N, K);
 }
 
-# Step 8 - matmul_tiled_2d_kernel (not yet solved)
-# TODO: implement
+# Step 8 - matmul_tiled_2d_kernel
+#include <cuda_runtime.h>
+
+constexpr int R2_BM = 64, R2_BN = 64, R2_BK = 8, R2_TM = 4, R2_TN = 4;
+
+__global__ void matmul_tiled_2d_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+    __shared__ float As[R2_BM * R2_BK];
+    __shared__ float Bs[R2_BK * R2_BN];
+
+    const int tid = threadIdx.x;
+
+    // Each thread owns a 4x4 output sub-tile.
+    const int row_start = (tid / 16) * R2_TM;
+    const int col_start = (tid % 16) * R2_TN;
+
+    const int block_row = blockIdx.y * R2_BM;
+    const int block_col = blockIdx.x * R2_BN;
+
+    float acc[R2_TM][R2_TN] = {};
+
+    const int num_tiles = (K + R2_BK - 1) / R2_BK;
+
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        const int k_base = tile * R2_BK;
+
+        // Load the 64x8 A tile. Each thread loads two elements.
+        for (int i = tid; i < R2_BM * R2_BK; i += 256) {
+            const int local_row = i / R2_BK;
+            const int local_col = i % R2_BK;
+
+            const int global_row = block_row + local_row;
+            const int global_col = k_base + local_col;
+
+            if (global_row < M && global_col < K) {
+                As[i] = A[global_row * K + global_col];
+            } else {
+                As[i] = 0.0f;
+            }
+        }
+
+        // Load the 8x64 B tile. Each thread loads two elements.
+        for (int i = tid; i < R2_BK * R2_BN; i += 256) {
+            const int local_row = i / R2_BN;
+            const int local_col = i % R2_BN;
+
+            const int global_row = k_base + local_row;
+            const int global_col = block_col + local_col;
+
+            if (global_row < K && global_col < N) {
+                Bs[i] = B[global_row * N + global_col];
+            } else {
+                Bs[i] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        for (int k = 0; k < R2_BK; ++k) {
+            float regA[R2_TM];
+            float regB[R2_TN];
+
+            #pragma unroll
+            for (int i = 0; i < R2_TM; ++i) {
+                regA[i] = As[(row_start + i) * R2_BK + k];
+            }
+
+            #pragma unroll
+            for (int j = 0; j < R2_TN; ++j) {
+                regB[j] = Bs[k * R2_BN + (col_start + j)];
+            }
+
+            #pragma unroll
+            for (int i = 0; i < R2_TM; ++i) {
+                #pragma unroll
+                for (int j = 0; j < R2_TN; ++j) {
+                    acc[i][j] += regA[i] * regB[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Store the 4x4 result with bounds checks.
+    #pragma unroll
+    for (int i = 0; i < R2_TM; ++i) {
+        const int global_row = block_row + row_start + i;
+
+        #pragma unroll
+        for (int j = 0; j < R2_TN; ++j) {
+            const int global_col = block_col + col_start + j;
+
+            if (global_row < M && global_col < N) {
+                C[global_row * N + global_col] = acc[i][j];
+            }
+        }
+    }
+}
+
+void launch_matmul_tiled_2d(const float* A, const float* B, float* C, int M, int N, int K) {
+    constexpr int THREADS = 256;
+
+    dim3 block(THREADS);
+    dim3 grid((N + R2_BN - 1) / R2_BN,
+              (M + R2_BM - 1) / R2_BM);
+
+    matmul_tiled_2d_kernel<<<grid, block>>>(A, B, C, M, N, K);
+}
 
 # Step 9 - matmul_vectorized_kernel (not yet solved)
 # TODO: implement
