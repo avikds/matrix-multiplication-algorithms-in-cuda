@@ -935,8 +935,79 @@ void launch_matmul_batched(const float* A, const float* B, float* C,
     matmul_batched_kernel<<<grid, block>>>(A, B, C, M, N, K);
 }
 
-# Step 13 - matmul_splitk_kernel (not yet solved)
-# TODO: implement
+# Step 13 - matmul_splitk_kernel
+constexpr int TILE_SPLITK = 16;
+
+__global__ void matmul_splitk_kernel(const float* A, const float* B, float* C,
+                                     int M, int N, int K, int k_per_split) {
+    __shared__ float As[TILE_SPLITK][TILE_SPLITK];
+    __shared__ float Bs[TILE_SPLITK][TILE_SPLITK];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int row = blockIdx.y * TILE_SPLITK + ty;
+    const int col = blockIdx.x * TILE_SPLITK + tx;
+
+    // This block handles:
+    // [split_start, split_end)
+    const int split = blockIdx.z;
+    const int split_start = split * k_per_split;
+    const int split_end = min(K, split_start + k_per_split);
+
+    float sum = 0.0f;
+
+    // Process the assigned K range using 16x16 tiles.
+    for (int k0 = split_start; k0 < split_end; k0 += TILE_SPLITK) {
+        const int a_col = k0 + tx;
+        const int b_row = k0 + ty;
+
+        // Load A tile.
+        if (row < M && a_col < split_end && a_col < K) {
+            As[ty][tx] = A[row * K + a_col];
+        } else {
+            As[ty][tx] = 0.0f;
+        }
+
+        // Load B tile.
+        if (b_row < split_end && b_row < K && col < N) {
+            Bs[ty][tx] = B[b_row * N + col];
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < TILE_SPLITK; ++k) {
+            sum += As[ty][k] * Bs[k][tx];
+        }
+
+        __syncthreads();
+    }
+
+    // Each split contributes a partial sum to the same C element.
+    if (row < M && col < N) {
+        atomicAdd(&C[row * N + col], sum);
+    }
+}
+
+void launch_matmul_splitk(const float* A, const float* B, float* C,
+                          int M, int N, int K, int splits) {
+    // Start C at zero so each split can atomically add its partial result.
+    cudaMemset(C, 0, static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(float));
+
+    const int k_per_split = (K + splits - 1) / splits;
+
+    dim3 block(TILE_SPLITK, TILE_SPLITK);
+    dim3 grid((N + TILE_SPLITK - 1) / TILE_SPLITK,
+              (M + TILE_SPLITK - 1) / TILE_SPLITK,
+              splits);
+
+    matmul_splitk_kernel<<<grid, block>>>(
+        A, B, C, M, N, K, k_per_split
+    );
+}
 
 # Step 14 - gemv_kernel (not yet solved)
 # TODO: implement
